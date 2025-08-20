@@ -1,0 +1,12 @@
+{
+  "ftp": {
+    "host": "your.ftp.server.com",
+    "port": "21",
+    "user": "your_username",
+    "password": "your_password"
+  },
+  "directories": {
+    "remote": "/path/to/remote/directory/",
+    "local": "/path/to/local/directory/"
+  }
+}
