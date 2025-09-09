@@ -7,58 +7,7 @@ import argparse
 import tempfile
 import difflib
 import json
-
-# === FTP File Sync with Conflict Resolution ===
-# 
-# SYSTEM REQUIREMENTS:
-# - Operating System: Linux (tested on Ubuntu, should work on any distribution)
-# - Python: 3.6+ (uses f-strings, pathlib compatibility)
-# - System package: lftp (for FTP operations)
-#
-# INSTALLATION:
-# 1. Install system dependencies:
-#    sudo apt-get update
-#    sudo apt-get install lftp python3 python3-pip python3-venv
-#
-# 2. Create and activate virtual environment:
-#    python3 -m venv ~/ftp-sync-env
-#    source ~/ftp-sync-env/bin/activate
-#
-# 3. Install Python packages:
-#    pip3 install watchdog
-#
-# 4. Create configuration file (config.json) in the same directory as sync.py:
-#    {
-#      "ftp": {
-#        "host": "your.ftp.server.com",
-#        "port": "21",
-#        "user": "your_username",
-#        "password": "your_password"
-#      },
-#      "directories": {
-#        "remote": "/path/to/remote/directory/",
-#        "local": "/path/to/local/directory/"
-#      }
-#    }
-#
-# 5. Verify installation:
-#    lftp --version        # Should show lftp version info
-#    python3 --version     # Should show Python 3.6+
-#
-# PYTHON PACKAGES REQUIRED:
-# - watchdog (pip package for file system monitoring)
-# - json (built-in, for reading configuration file)
-# - argparse (built-in, for command-line argument parsing)
-# - subprocess (built-in, for running lftp commands)
-# - tempfile (built-in, for temporary file handling)
-# - difflib (built-in, for showing file differences)
-# - os, time (built-in standard library)
-#
-# USAGE:
-# source ~/ftp-sync-env/bin/activate
-# python3 ./sync.py                    # Standard mode (auto-upload without conflict checking)
-# python3 ./sync.py --check-conflicts  # Conflict resolution mode (shows diffs, prompts for action)
-# python3 ./sync.py -h                 # Show help 
+import fnmatch
 
 def load_config(config_path="sync_config.json"):
     """Load configuration from external JSON file"""
@@ -84,10 +33,81 @@ FTP_PASS = CONFIG['ftp']['password']
 REMOTE_DIR = CONFIG['directories']['remote']
 LOCAL_DIR = CONFIG['directories']['local']
 
+# Load ignore patterns from config
+IGNORE_PATTERNS = []
+cfg_ignore = CONFIG['ignore'] if 'ignore' in CONFIG else []
+if isinstance(cfg_ignore, list):
+    IGNORE_PATTERNS.extend([p.strip() for p in cfg_ignore if p.strip()])
+
+if IGNORE_PATTERNS:
+    print(f"Loaded ignore patterns: {IGNORE_PATTERNS}")
+
+
+def test_ftp_connection(timeout=15):
+    "Test FTP connection using lftp."
+    
+    test_cmd = f"""
+    set net:max-retries 2;
+    set net:timeout {timeout};
+    ls {REMOTE_DIR};
+    bye
+    """
+    try:
+        result = subprocess.run([
+            "lftp", "-u", f"{FTP_USER},{FTP_PASS}", "-p", FTP_PORT, FTP_HOST,
+            "-e", test_cmd
+        ], capture_output=True, text=True, timeout=timeout + 5)
+    except FileNotFoundError:
+        print("❌ 'lftp' command not found. Please install 'lftp' and ensure it's in PATH.")
+        exit(1)
+    except subprocess.TimeoutExpired:
+        print(f"❌ FTP connection timed out after {timeout} seconds when contacting {FTP_HOST}:{FTP_PORT}")
+        exit(1)
+
+    if result.returncode != 0:
+        print(f"❌ FTP connection test failed (return code {result.returncode}).")
+        if result.stdout:
+            print("--- lftp stdout ---")
+            print(result.stdout.strip())
+        if result.stderr:
+            print("--- lftp stderr ---")
+            print(result.stderr.strip())
+        exit(1)
+    else:
+        print(f"✅ FTP connection to {FTP_HOST}:{FTP_PORT} OK. Remote dir: {REMOTE_DIR}")
+
 class FTPUploader(FileSystemEventHandler):
     def __init__(self, check_conflicts=False):
         self.check_conflicts = check_conflicts
         self.session_overrides = {}  # Track files we've chosen to always override this session
+
+    def is_ignored(self, rel_path, filename, abs_path):
+        """Return True if the path or filename matches any ignore pattern."""
+        if not IGNORE_PATTERNS:
+            return False
+
+        # Normalize to forward slashes for pattern matching
+        rel_path_unified = rel_path.replace(os.sep, '/')
+
+        for pat in IGNORE_PATTERNS:
+            if not pat:
+                continue
+            pat = pat.strip()
+            # treat directory patterns ending with '/' as prefix match
+            if pat.endswith('/'):
+                prefix = pat.rstrip('/')
+                if rel_path_unified == prefix or rel_path_unified.startswith(prefix + '/'):
+                    return True
+            # fnmatch against relative path and filename
+            if fnmatch.fnmatch(rel_path_unified, pat) or fnmatch.fnmatch(filename, pat):
+                return True
+            # absolute path pattern
+            try:
+                if os.path.isabs(pat) and abs_path.startswith(pat):
+                    return True
+            except Exception:
+                pass
+        return False
     
     def remote_file_exists(self, remote_path, filename):
         """Check if remote file exists"""
@@ -109,8 +129,6 @@ class FTPUploader(FileSystemEventHandler):
                     return True
         
         return False
-    
-
     
     def files_are_identical(self, local_path, remote_temp_path):
         """Compare two files to check if they are identical"""
@@ -142,7 +160,6 @@ class FTPUploader(FileSystemEventHandler):
         ], capture_output=True, text=True)
         
         if result.returncode == 0:
-            # Check if file was actually downloaded
             if os.path.exists(temp_path) and os.path.getsize(temp_path) >= 0:
                 return temp_path
             else:
@@ -257,6 +274,11 @@ class FTPUploader(FileSystemEventHandler):
             remote_path = REMOTE_DIR.rstrip("/")
         filename = os.path.basename(event.src_path)
 
+        # If the path matches ignore patterns, skip processing
+        if self.is_ignored(rel_path, filename, event.src_path):
+            print(f"Skipping ignored path: {rel_path}")
+            return
+
         print(f"Processing: {rel_path} → {remote_path}/{filename}")
 
         # Check for conflicts if enabled
@@ -292,7 +314,7 @@ class FTPUploader(FileSystemEventHandler):
                 else:
                     print(f"Failed to download remote file for comparison. Proceeding with upload...")
             else:
-                print(f"ℹ️  No remote file found. Proceeding with upload...")
+                print(f"No remote file found. Proceeding with upload...")
 
         # Proceed with upload (either no conflict check, no remote file, or user chose to upload)
         print(f"Uploading: {filename}")
@@ -338,7 +360,8 @@ if __name__ == "__main__":
                        help='Enable conflict resolution mode. When enabled, checks if remote files exist and shows differences before uploading.')
     args = parser.parse_args()
     
-    # Create event handler with conflict checking option
+    test_ftp_connection()
+    
     event_handler = FTPUploader(check_conflicts=args.check_conflicts)
     observer = Observer()
     observer.schedule(event_handler, LOCAL_DIR, recursive=True)

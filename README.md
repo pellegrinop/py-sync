@@ -56,6 +56,12 @@ Create a `config.json` file in the same directory as `sync.py`:
     "remote": "/path/to/remote/directory/",
     "local": "/path/to/local/directory/"
   }
+   ,
+   "ignore": [
+      "node_modules/",
+      "*.tmp",
+      "build/"
+   ]
 }
 ```
 
@@ -141,6 +147,26 @@ python_sync/
 - `remote`: Absolute path to the remote directory on the FTP server
 - `local`: Absolute path to the local directory to monitor
 
+### Ignore patterns
+- `ignore`: Optional list of patterns to skip files or folders during processing. Patterns support shell-style globs (via `fnmatch`) and absolute paths.
+- If you want to ignore a folder, the pattern must end with a trailing slash (`/`). For example, to ignore `node_modules` and any of its contents, use `"node_modules/"`.
+- File patterns like `"*.tmp"` will match files by name.
+
+Examples:
+
+```json
+"ignore": [
+   "node_modules/",   # ignore the node_modules folder and everything under it
+   "build/",          # ignore build folder
+   "*.tmp",           # ignore all .tmp files
+   "/absolute/path/to/ignore/"  # ignore a specific absolute folder path
+]
+```
+
+Notes:
+- Directory patterns must end with `/` to be treated as folder-prefix matches.
+- Patterns are matched against the relative path (normalized to use `/`) and against filenames. Absolute path patterns are also supported.
+
 ## 🛡️ Security Considerations
 
 - Keep your `config.json` file secure and never commit it to version control
@@ -183,6 +209,14 @@ which lftp
 # Verify Python packages
 pip list | grep watchdog
 ```
+
+### Connection test at startup
+
+- The script now performs a quick FTP connection test at startup using `lftp` and will exit early if the connection fails.
+- On failure the program prints `lftp`'s stdout and stderr so you can see the exact FTP error (authentication, permissions, host not found, etc.).
+- If `lftp` is not available, you'll see a clear message asking you to install it.
+
+This helps surface the real reason a connection to the FTP server cannot be established so you can fix credentials or network issues before the watcher starts.
 
 ## 🤝 Contributing
 

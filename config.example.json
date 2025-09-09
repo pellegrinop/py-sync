@@ -8,5 +8,12 @@
   "directories": {
     "remote": "/path/to/remote/directory/",
     "local": "/path/to/local/directory/"
-  }
+  },
+  "ignore": [
+    ".vscode/",
+    ".git/",
+    "node_modules/",
+    "sync_config.json",
+    "*.log"
+  ]
 }
