@@ -17,7 +17,7 @@ def load_config(config_path="sync_config.json"):
         return config
     except FileNotFoundError:
         print(f"❌ Configuration file '{config_path}' not found!")
-        print("Please create a config.json file with your FTP settings.")
+        print("Please create a sync_config.json file with your FTP settings.")
         print("See documentation in the script for the required format.")
         exit(1)
     except json.JSONDecodeError as e:
@@ -80,6 +80,26 @@ class FTPUploader(FileSystemEventHandler):
     def __init__(self, check_conflicts=False):
         self.check_conflicts = check_conflicts
         self.session_overrides = {}  # Track files we've chosen to always override this session
+
+    def run_lftp_cmd(self, lftp_commands):
+        """Execute lftp commands."""
+        return subprocess.run([
+            "lftp", "-u", f"{FTP_USER},{FTP_PASS}", "-p", FTP_PORT, FTP_HOST,
+            "-e", f"{lftp_commands}; bye"
+        ], capture_output=True, text=True)
+
+    def get_remote_paths(self, local_path):
+        """Helper to get remote path and filename"""
+        rel_path = os.path.relpath(local_path, LOCAL_DIR)
+        rel_dir = os.path.dirname(rel_path)
+        if rel_dir:
+            remote_dir = os.path.join(REMOTE_DIR, rel_dir).replace("\\", "/")
+        else:
+            remote_dir = REMOTE_DIR.rstrip("/")
+        
+        filename = os.path.basename(local_path)
+        remote_full_path = os.path.join(REMOTE_DIR, rel_path).replace("\\", "/")
+        return remote_dir, filename, remote_full_path, rel_path
 
     def is_ignored(self, rel_path, filename, abs_path):
         """Return True if the path or filename matches any ignore pattern."""
@@ -257,6 +277,63 @@ class FTPUploader(FileSystemEventHandler):
             else:
                 print("Invalid choice. Please enter 1, 2, 3, or 4.")
 
+    def on_created(self, event):
+        remote_dir, filename, remote_full, rel = self.get_remote_paths(event.src_path)
+        if self.is_ignored(rel, filename, event.src_path):
+            return
+        
+        if event.is_directory:
+            print(f"📁 Creating remote directory: {remote_full}")
+            self.run_lftp_cmd(f"mkdir -p {remote_full}")
+        else:
+            self.on_modified(event)
+
+    def on_deleted(self, event):
+        remote_dir, filename, remote_full, rel = self.get_remote_paths(event.src_path)
+        # Filter out temporary files and ignored patterns
+        if "_remote_temp" in filename or self.is_ignored(rel, filename, event.src_path):
+            return
+            
+        if event.is_directory:
+            print(f"🗑️  Deleting remote directory: {remote_full}")
+            self.run_lftp_cmd(f"rm -r {remote_full}")
+        else:
+            print(f"🗑️  Deleting remote file: {remote_full}")
+            self.run_lftp_cmd(f"rm {remote_full}")
+
+    def on_moved(self, event):
+        remote_dir_src, file_src, remote_full_src, rel_src = self.get_remote_paths(event.src_path)
+        remote_dir_dest, file_dest, remote_full_dest, rel_dest = self.get_remote_paths(event.dest_path)
+        
+        src_ignored = self.is_ignored(rel_src, file_src, event.src_path)
+        dest_ignored = self.is_ignored(rel_dest, file_dest, event.dest_path)
+        
+        if src_ignored and dest_ignored:
+            return
+            
+        if src_ignored and not dest_ignored:
+            # Creation at dest
+            if event.is_directory:
+                self.run_lftp_cmd(f"mkdir -p {remote_full_dest}")
+            else:
+                # We need to trigger an upload for the new path
+                from watchdog.events import FileModifiedEvent
+                self.on_modified(FileModifiedEvent(event.dest_path))
+            return
+
+        if not src_ignored and dest_ignored:
+            # Deletion at src
+            if event.is_directory:
+                self.run_lftp_cmd(f"rm -r {remote_full_src}")
+            else:
+                self.run_lftp_cmd(f"rm {remote_full_src}")
+            return
+            
+        # Both not ignored: move
+        print(f"🚚 Moving remote: {remote_full_src} -> {remote_full_dest}")
+        dest_parent = os.path.dirname(remote_full_dest)
+        self.run_lftp_cmd(f"mkdir -p {dest_parent}; mv {remote_full_src} {remote_full_dest}")
+
     def on_modified(self, event):
         if event.is_directory:
             return
@@ -266,13 +343,7 @@ class FTPUploader(FileSystemEventHandler):
         if "_remote_temp" in filename:
             return
 
-        rel_path = os.path.relpath(event.src_path, LOCAL_DIR)
-        rel_dir = os.path.dirname(rel_path)
-        if rel_dir:
-            remote_path = os.path.join(REMOTE_DIR, rel_dir).replace("\\", "/")
-        else:
-            remote_path = REMOTE_DIR.rstrip("/")
-        filename = os.path.basename(event.src_path)
+        remote_path, filename, remote_full, rel_path = self.get_remote_paths(event.src_path)
 
         # If the path matches ignore patterns, skip processing
         if self.is_ignored(rel_path, filename, event.src_path):
@@ -320,31 +391,14 @@ class FTPUploader(FileSystemEventHandler):
         print(f"Uploading: {filename}")
         
         # First, try to upload the file directly
-        upload_cmd = f"""
-        cd {remote_path};
-        put {event.src_path};
-        bye
-        """
-
-        result = subprocess.run([
-            "lftp", "-u", f"{FTP_USER},{FTP_PASS}", "-p", FTP_PORT, FTP_HOST,
-            "-e", upload_cmd
-        ], capture_output=True, text=True)
+        upload_cmd = f"cd {remote_path}; put {event.src_path}"
+        result = self.run_lftp_cmd(upload_cmd)
 
         # If upload failed, check if it's due to missing directory
         if result.returncode != 0:
             print(f"Upload failed, creating directory and retrying...")
-            create_and_upload_cmd = f"""
-            mkdir -p {remote_path};
-            cd {remote_path};
-            put {event.src_path};
-            bye
-            """
-            
-            retry_result = subprocess.run([
-                "lftp", "-u", f"{FTP_USER},{FTP_PASS}", "-p", FTP_PORT, FTP_HOST,
-                "-e", create_and_upload_cmd
-            ], capture_output=True, text=True)
+            create_and_upload_cmd = f"mkdir -p {remote_path}; cd {remote_path}; put {event.src_path}"
+            retry_result = self.run_lftp_cmd(create_and_upload_cmd)
 
             if retry_result.returncode == 0:
                 print(f"✅ Successfully uploaded after creating directory: {filename}")
