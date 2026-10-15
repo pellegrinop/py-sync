@@ -17,7 +17,7 @@ def load_config(config_path="sync_config.json"):
         return config
     except FileNotFoundError:
         print(f"❌ Configuration file '{config_path}' not found!")
-        print("Please create a sync_config.json file with your FTP settings.")
+        print("Please create a config.json file with your FTP settings.")
         print("See documentation in the script for the required format.")
         exit(1)
     except json.JSONDecodeError as e:
@@ -106,27 +106,36 @@ class FTPUploader(FileSystemEventHandler):
         if not IGNORE_PATTERNS:
             return False
 
-        # Normalize to forward slashes for pattern matching
-        rel_path_unified = rel_path.replace(os.sep, '/')
+        rel_path_unified = rel_path.replace('\\', '/').replace(os.sep, '/').strip('/')
+        path_parts = rel_path_unified.split('/') if rel_path_unified else []
 
-        for pat in IGNORE_PATTERNS:
-            if not pat:
+        for raw_pattern in IGNORE_PATTERNS:
+            if not raw_pattern:
                 continue
-            pat = pat.strip()
-            # treat directory patterns ending with '/' as prefix match
-            if pat.endswith('/'):
-                prefix = pat.rstrip('/')
-                if rel_path_unified == prefix or rel_path_unified.startswith(prefix + '/'):
+            pattern = raw_pattern.strip().replace('\\', '/')
+            if not pattern:
+                continue
+
+            anchored = pattern.startswith('/')
+            pattern = pattern.strip('/')
+            if not pattern:
+                continue
+
+            pattern_parts = pattern.split('/')
+            if len(pattern_parts) == 1 and not anchored:
+                if any(fnmatch.fnmatchcase(part, pattern) for part in path_parts):
                     return True
-            # fnmatch against relative path and filename
-            if fnmatch.fnmatch(rel_path_unified, pat) or fnmatch.fnmatch(filename, pat):
-                return True
-            # absolute path pattern
-            try:
-                if os.path.isabs(pat) and abs_path.startswith(pat):
-                    return True
-            except Exception:
-                pass
+                continue
+
+            # A leading slash anchors the pattern at the sync root. Without
+            # one, a path pattern may match at any directory depth.
+            starts = (0,) if anchored else range(len(path_parts))
+            for start in starts:
+                for end in range(start + 1, len(path_parts) + 1):
+                    candidate = '/'.join(path_parts[start:end])
+                    if fnmatch.fnmatchcase(candidate, pattern):
+                        return True
+
         return False
     
     def remote_file_exists(self, remote_path, filename):
